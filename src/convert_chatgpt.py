@@ -9,6 +9,7 @@ import sys
 import shutil
 from datetime import datetime
 from pathlib import Path
+import hashlib
 import ijson
 import re
 from typing import Dict, Any, List, Tuple, Optional, Set
@@ -25,8 +26,237 @@ from convert_enhanced import KeywordExtractor
 from tag_analyzer import TagAnalyzer
 from converter_base import (
     DecimalEncoder, create_conversation_structure, detect_markdown,
-    extract_code_snippets, enhance_markdown_content, save_message_files
+    extract_code_snippets, enhance_markdown_content, save_message_files,
+    safe_path_component
 )
+
+
+def parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO8601 timestamp into a datetime when possible."""
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_date_info(created_at: str) -> Dict[str, str]:
+    """Build the year/month/day folder structure info from a timestamp."""
+    created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+    return {
+        'year': created_dt.strftime('%Y'),
+        'month': created_dt.strftime('%m'),
+        'month_name': created_dt.strftime('%B'),
+        'day': created_dt.strftime('%d')
+    }
+
+
+def build_conversation_folder_name(conversation: Dict[str, Any]) -> Tuple[str, str]:
+    """Return a human title and folder name for a conversation."""
+    conv_title = conversation['name'].replace('_', ' ')
+    conv_id = conversation['uuid'][:8] if len(conversation['uuid']) >= 8 else conversation['uuid']
+    conv_folder_name = f"{safe_path_component(conv_title)}_{conv_id}"
+    return conv_title, conv_folder_name
+
+
+def build_conversation_fingerprint(conversation: Dict[str, Any]) -> str:
+    """Create a stable fallback fingerprint for message-level change detection."""
+    payload = {
+        'name': conversation.get('name', ''),
+        'message_count': len(conversation.get('chat_messages', [])),
+        'messages': [
+            {
+                'uuid': msg.get('uuid', ''),
+                'sender': msg.get('sender', ''),
+                'created_at': msg.get('created_at', ''),
+                'text': msg.get('text', '')
+            }
+            for msg in conversation.get('chat_messages', [])
+        ]
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    )
+    return digest.hexdigest()
+
+
+def build_existing_fingerprint(conversation_dir: Path) -> str:
+    """Create a fingerprint for an already imported conversation directory."""
+    messages_dir = conversation_dir / 'messages'
+    message_payload = []
+
+    for message_file in sorted(messages_dir.glob("*.json")):
+        try:
+            message = json.loads(message_file.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        message_payload.append(
+            {
+                'uuid': message.get('uuid', ''),
+                'sender': message.get('sender', ''),
+                'created_at': message.get('created_at', ''),
+                'text': message.get('text', '')
+            }
+        )
+
+    digest = hashlib.sha256(
+        json.dumps(message_payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    )
+    return digest.hexdigest()
+
+
+def load_existing_conversation_index(existing_root: Optional[Path]) -> Dict[str, Dict[str, Any]]:
+    """Scan prior imported batches and build a canonical conversation index by UUID."""
+    if not existing_root or not existing_root.exists():
+        return {}
+
+    canonical: Dict[str, Dict[str, Any]] = {}
+
+    for metadata_path in sorted(existing_root.rglob('metadata.json')):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        except Exception as exc:
+            print(f"⚠️  Skipping unreadable metadata file {metadata_path}: {exc}")
+            continue
+
+        uuid = metadata.get('uuid')
+        if not uuid:
+            continue
+
+        conversation_dir = metadata_path.parent
+        batch_id = None
+        relative_path = None
+        try:
+            rel = conversation_dir.relative_to(existing_root)
+            parts = rel.parts
+            if parts:
+                batch_id = parts[0]
+            if len(parts) > 2 and parts[1] == 'conversations':
+                relative_path = str(Path(*parts[2:]))
+            else:
+                relative_path = str(rel)
+        except ValueError:
+            relative_path = str(conversation_dir)
+
+        record = {
+            'uuid': uuid,
+            'name': metadata.get('name', ''),
+            'created_at': metadata.get('created_at'),
+            'updated_at': metadata.get('updated_at'),
+            'message_count': metadata.get('message_count', 0),
+            'path': str(conversation_dir),
+            'relative_path': relative_path,
+            'batch_id': batch_id,
+            'fingerprint': build_existing_fingerprint(conversation_dir),
+        }
+
+        current = canonical.get(uuid)
+        if current is None:
+            canonical[uuid] = record
+            continue
+
+        current_updated = parse_iso8601(current.get('updated_at')) or parse_iso8601(current.get('created_at'))
+        record_updated = parse_iso8601(record.get('updated_at')) or parse_iso8601(record.get('created_at'))
+        if current_updated is None or (record_updated is not None and record_updated >= current_updated):
+            canonical[uuid] = record
+
+    return canonical
+
+
+def build_delta_plan(
+    conversations: List[Dict[str, Any]],
+    existing_index: Dict[str, Dict[str, Any]],
+    delta_policy: str,
+) -> Dict[str, Any]:
+    """Classify conversations into new, changed, or unchanged for delta imports."""
+    entries = []
+    selected = []
+    selected_lookup: Dict[str, Dict[str, Any]] = {}
+    counts = {'new': 0, 'changed': 0, 'unchanged': 0}
+
+    for conversation in conversations:
+        uuid = conversation['uuid']
+        existing = existing_index.get(uuid)
+        fingerprint = build_conversation_fingerprint(conversation)
+        action = 'new'
+        reason = 'uuid_not_found'
+
+        if existing:
+            incoming_updated = parse_iso8601(conversation.get('updated_at'))
+            existing_updated = parse_iso8601(existing.get('updated_at'))
+
+            if incoming_updated and existing_updated:
+                if incoming_updated > existing_updated:
+                    action = 'changed'
+                    reason = 'updated_at_newer'
+                else:
+                    action = 'unchanged'
+                    reason = 'updated_at_not_newer'
+            elif not existing.get('updated_at'):
+                if (
+                    len(conversation.get('chat_messages', [])) != existing.get('message_count', 0)
+                    or fingerprint != existing.get('fingerprint')
+                ):
+                    action = 'changed'
+                    reason = 'existing_updated_at_missing_and_content_differs'
+                else:
+                    action = 'unchanged'
+                    reason = 'existing_updated_at_missing_but_content_matches'
+            elif incoming_updated is None:
+                if (
+                    len(conversation.get('chat_messages', [])) != existing.get('message_count', 0)
+                    or fingerprint != existing.get('fingerprint')
+                ):
+                    action = 'changed'
+                    reason = 'incoming_updated_at_missing_and_content_differs'
+                else:
+                    action = 'unchanged'
+                    reason = 'incoming_updated_at_missing_but_content_matches'
+            elif fingerprint != existing.get('fingerprint'):
+                action = 'changed'
+                reason = 'timestamps_equal_but_content_differs'
+            else:
+                action = 'unchanged'
+                reason = 'content_matches_existing'
+
+        should_write = action == 'new' or (action == 'changed' and delta_policy == 'new-and-changed')
+        counts[action] += 1
+
+        entry = {
+            'uuid': uuid,
+            'name': conversation.get('name', ''),
+            'created_at': conversation.get('created_at'),
+            'updated_at': conversation.get('updated_at'),
+            'message_count': len(conversation.get('chat_messages', [])),
+            'classification': action,
+            'reason': reason,
+            'will_write': should_write,
+            'incoming_fingerprint': fingerprint,
+        }
+
+        if existing:
+            entry['existing'] = {
+                'batch_id': existing.get('batch_id'),
+                'relative_path': existing.get('relative_path'),
+                'created_at': existing.get('created_at'),
+                'updated_at': existing.get('updated_at'),
+                'message_count': existing.get('message_count', 0),
+            }
+
+        entries.append(entry)
+        if should_write:
+            selected.append(conversation)
+            selected_lookup[uuid] = entry
+
+    return {
+        'entries': entries,
+        'counts': counts,
+        'selected': selected,
+        'selected_lookup': selected_lookup,
+    }
+
 
 class ChatGPTConverter:
     """Convert ChatGPT export to Claude converter format"""
@@ -37,21 +267,22 @@ class ChatGPTConverter:
         self.keyword_extractor = KeywordExtractor()
         self.tag_analyzer = TagAnalyzer()  # Initialize for tag analysis
         
-    def parse_export(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Parse ChatGPT conversations.json and convert to Claude format"""
+    def parse_export(self, file_paths: List[Path]) -> List[Dict[str, Any]]:
+        """Parse one or more ChatGPT conversation JSON files into a unified list."""
         conversations = []
-        
-        with open(file_path, 'rb') as file:
-            parser = ijson.items(file, 'item')
-            
-            for conv_data in parser:
-                try:
-                    conversation = self._convert_conversation(conv_data)
-                    if conversation:
-                        conversations.append(conversation)
-                except Exception as e:
-                    print(f"Error parsing conversation: {e}")
-                    continue
+
+        for file_path in file_paths:
+            with open(file_path, 'rb') as file:
+                parser = ijson.items(file, 'item')
+
+                for conv_data in parser:
+                    try:
+                        conversation = self._convert_conversation(conv_data)
+                        if conversation:
+                            conversations.append(conversation)
+                    except Exception as e:
+                        print(f"Error parsing conversation from {file_path.name}: {e}")
+                        continue
         
         return conversations
     
@@ -111,29 +342,31 @@ class ChatGPTConverter:
         
         return messages
     
-    def _traverse_message_tree(self, mapping: Dict[str, Any], node_id: str, 
+    def _traverse_message_tree(self, mapping: Dict[str, Any], node_id: str,
                                messages: List[Dict[str, Any]], visited: set = None):
-        """Recursively traverse the message tree"""
+        """Traverse the message tree iteratively to avoid recursion-depth failures."""
         if visited is None:
             visited = set()
-        
-        if node_id in visited or node_id not in mapping:
-            return
-        
-        visited.add(node_id)
-        node = mapping[node_id]
-        
-        # Extract message if present
-        if 'message' in node and node['message']:
-            msg_data = node['message']
-            message = self._parse_message(msg_data)
-            if message and message.get('text'):  # Only add non-empty messages
-                messages.append(message)
-        
-        # Traverse children
-        children = node.get('children', [])
-        for child_id in children:
-            self._traverse_message_tree(mapping, child_id, messages, visited)
+
+        stack = [node_id]
+        while stack:
+            current_id = stack.pop()
+            if current_id in visited or current_id not in mapping:
+                continue
+
+            visited.add(current_id)
+            node = mapping[current_id]
+
+            if 'message' in node and node['message']:
+                msg_data = node['message']
+                message = self._parse_message(msg_data)
+                if message and message.get('text'):
+                    messages.append(message)
+
+            children = node.get('children', [])
+            for child_id in reversed(children):
+                if child_id not in visited:
+                    stack.append(child_id)
     
     def _parse_message(self, msg_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse a single message to Claude format"""
@@ -191,8 +424,14 @@ class ChatGPTConverter:
         
         return message
     
-    def save_conversation(self, conversation: Dict[str, Any], conv_folder: Path, 
-                         conv_title: str, date_info: Dict[str, str]):
+    def save_conversation(
+        self,
+        conversation: Dict[str, Any],
+        conv_folder: Path,
+        conv_title: str,
+        date_info: Dict[str, str],
+        import_provenance: Optional[Dict[str, Any]] = None,
+    ):
         """Save conversation using Claude converter format"""
         # Create a unique conversation tag
         conv_id = conversation['uuid'][:8] if len(conversation['uuid']) >= 8 else conversation['uuid']
@@ -230,6 +469,14 @@ class ChatGPTConverter:
             'keywords': conversation_keywords,
             'source': 'chatgpt'  # Add source indicator
         }
+
+        if import_provenance:
+            metadata['import_action'] = import_provenance.get('classification', 'new')
+            metadata['import_reason'] = import_provenance.get('reason')
+            existing = import_provenance.get('existing')
+            if existing:
+                metadata['replaces_batch'] = existing.get('batch_id')
+                metadata['replaces_relative_path'] = existing.get('relative_path')
         
         # Save messages
         messages_folder = conv_folder / 'messages'
@@ -350,12 +597,12 @@ class ChatGPTConverter:
         if images_copied > 0:
             print(f"  Copied {images_copied} images to {conv_folder.name}/images/")
     
-    def convert(self, input_file: Path):
+    def convert(self, input_files: List[Path]):
         """Main conversion method"""
-        print(f"Converting ChatGPT export: {input_file}")
+        print(f"Converting ChatGPT export from {len(input_files)} conversation files")
         
         # Parse conversations
-        conversations = self.parse_export(input_file)
+        conversations = self.parse_export(input_files)
         print(f"Found {len(conversations)} conversations")
         
         # Create output structure
@@ -379,7 +626,7 @@ class ChatGPTConverter:
                 # Create conversation folder
                 conv_title = conversation['name'].replace('_', ' ')
                 conv_id = conversation['uuid'][:8] if len(conversation['uuid']) >= 8 else conversation['uuid']
-                conv_folder_name = f"{conv_title.replace(' ', '_')}_{conv_id}"
+                conv_folder_name = f"{safe_path_component(conv_title)}_{conv_id}"
                 
                 conv_folder = create_conversation_structure(
                     conv_output_dir,
@@ -432,7 +679,7 @@ class ChatGPTConverter:
             'features': [
                 'ChatGPT to Claude format conversion',
                 'Enhanced markdown titles with full conversation context',
-                'Automatic keyword extraction and hashtag generation',
+                'Automatic keyword extraction stored in conversation metadata',
                 'Human-readable titles throughout',
                 'Markdown files saved as .md with proper headers',
                 'Code blocks extracted to separate files',
@@ -481,7 +728,11 @@ class ChatGPTConverter:
 
 def convert_chatgpt_history(input_path: Path, output_path: Path,
                            skip_tags: bool = False,
-                           generate_embeddings: bool = True) -> bool:
+                           generate_embeddings: bool = True,
+                           existing_root: Optional[Path] = None,
+                           import_mode: str = 'delta',
+                           delta_policy: str = 'new-and-changed',
+                           plan_json_path: Optional[Path] = None) -> bool:
     """
     Convert ChatGPT chat history to searchable knowledge base.
 
@@ -523,18 +774,52 @@ def convert_chatgpt_history(input_path: Path, output_path: Path,
 
         # Create converter and process
         converter = ChatGPTConverter(output_base, input_dir)
-        conversations_file = input_dir / 'conversations.json'
+        conversations_files = sorted(input_dir.glob('conversations*.json'))
 
-        if not conversations_file.exists():
-            print(f"❌ Error: conversations.json not found in {input_dir}")
+        if not conversations_files:
+            print(f"❌ Error: no conversations.json or conversations-*.json files found in {input_dir}")
             return False
 
         print(f"\n🔄 Converting conversations...")
 
         # Parse all conversations
-        conversations = converter.parse_export(conversations_file)
+        conversations = converter.parse_export(conversations_files)
+        discovered_count = len(conversations)
+        print(f"   Found {discovered_count} conversations")
+
+        delta_counts = {'new': discovered_count, 'changed': 0, 'unchanged': 0}
+        plan_entries: List[Dict[str, Any]] = []
+        selected_lookup: Dict[str, Dict[str, Any]] = {}
+        existing_index: Dict[str, Dict[str, Any]] = {}
+
+        if import_mode == 'delta':
+            existing_index = load_existing_conversation_index(existing_root)
+            delta_plan = build_delta_plan(conversations, existing_index, delta_policy)
+            conversations = delta_plan['selected']
+            plan_entries = delta_plan['entries']
+            selected_lookup = delta_plan['selected_lookup']
+            delta_counts = delta_plan['counts']
+
+            print(f"   Delta plan: {delta_counts['new']} new, {delta_counts['changed']} changed, {delta_counts['unchanged']} unchanged")
+            print(f"   Will write {len(conversations)} conversations into this batch")
+
+            plan_payload = {
+                'created_at': datetime.now().isoformat() + 'Z',
+                'mode': import_mode,
+                'delta_policy': delta_policy,
+                'existing_root': str(existing_root) if existing_root else None,
+                'counts': delta_counts,
+                'entries': plan_entries,
+            }
+            with open(output_base / 'import_plan.json', 'w', encoding='utf-8') as f:
+                json.dump(plan_payload, f, indent=2, ensure_ascii=False, cls=DecimalEncoder)
+
+            if plan_json_path:
+                plan_json_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(plan_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(plan_payload, f, indent=2, ensure_ascii=False, cls=DecimalEncoder)
+
         total_count = len(conversations)
-        print(f"   Found {total_count} conversations")
 
         # Collect for embedding generation
         conversations_to_embed = []
@@ -544,28 +829,23 @@ def convert_chatgpt_history(input_path: Path, output_path: Path,
         for idx, conversation in enumerate(conversations):
             try:
                 # Get date info
-                created_at = datetime.fromisoformat(conversation['created_at'].replace('Z', '+00:00'))
-                date_info = {
-                    'year': created_at.strftime('%Y'),
-                    'month': created_at.strftime('%m'),
-                    'month_name': created_at.strftime('%B'),
-                    'day': created_at.strftime('%d')
-                }
+                date_info = build_date_info(conversation['created_at'])
 
                 # Create conversation folder
-                conv_title = conversation['name'].replace('_', ' ')
-                conv_id = conversation['uuid'][:8] if len(conversation['uuid']) >= 8 else conversation['uuid']
-                conv_folder_name = f"{conv_title.replace(' ', '_')}_{conv_id}"
+                conv_title, conv_folder_name = build_conversation_folder_name(conversation)
 
                 # Create folder path from converter_base
                 from converter_base import create_conversation_structure as create_conv_struct
                 conv_folder = create_conv_struct(conversations_folder, date_info, conv_folder_name)
 
                 # Save conversation metadata and messages
-                converter.save_conversation(conversation, conv_folder, conv_title, date_info)
-
-                # Copy images if present
-                converter._copy_conversation_images(conversation, conv_folder)
+                converter.save_conversation(
+                    conversation,
+                    conv_folder,
+                    conv_title,
+                    date_info,
+                    import_provenance=selected_lookup.get(conversation['uuid']),
+                )
 
                 # Read metadata to populate database
                 metadata_file = conv_folder / 'metadata.json'
@@ -655,7 +935,7 @@ def convert_chatgpt_history(input_path: Path, output_path: Path,
         summary = {
             'created_at': datetime.now().isoformat(),
             'source_files': {
-                'conversations.json': conversations_file.exists()
+                'conversation_files': [path.name for path in conversations_files]
             },
             'output_structure': {
                 'conversations': 'conversations/{year}/{month}/{day}/{conversation_name}/',
@@ -665,7 +945,13 @@ def convert_chatgpt_history(input_path: Path, output_path: Path,
                 'keyword_extraction': True,
                 'embeddings_generated': generate_embeddings
             },
-            'statistics': stats
+            'statistics': stats,
+            'import_mode': import_mode,
+            'delta_policy': delta_policy if import_mode == 'delta' else None,
+            'delta_counts': delta_counts,
+            'existing_root': str(existing_root) if existing_root else None,
+            'total_conversations_discovered': discovered_count,
+            'total_conversations_written': total_count,
         }
 
         with open(output_base / 'conversion_summary.json', 'w') as f:
@@ -718,12 +1004,12 @@ def convert_chatgpt_history(input_path: Path, output_path: Path,
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python convert_chatgpt.py <path_to_conversations.json> [output_dir]")
+        print("Usage: python convert_chatgpt.py <path_to_export_dir_or_conversations.json> [output_dir]")
         sys.exit(1)
     
-    input_file = Path(sys.argv[1])
-    if not input_file.exists():
-        print(f"Error: Input file '{input_file}' not found")
+    input_path = Path(sys.argv[1])
+    if not input_path.exists():
+        print(f"Error: Input path '{input_path}' not found")
         sys.exit(1)
     
     # Set output directory
@@ -732,12 +1018,20 @@ def main():
     else:
         output_dir = Path('claude_history_enhanced')
     
-    # Determine input directory (parent of conversations.json)
-    input_dir = input_file.parent
+    if input_path.is_dir():
+        input_dir = input_path
+        input_files = sorted(input_dir.glob('conversations*.json'))
+    else:
+        input_dir = input_path.parent
+        input_files = [input_path]
+
+    if not input_files:
+        print(f"Error: no conversations.json or conversations-*.json files found in '{input_dir}'")
+        sys.exit(1)
     
     # Create converter and run
     converter = ChatGPTConverter(output_dir, input_dir)
-    converter.convert(input_file)
+    converter.convert(input_files)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,19 @@ class DecimalEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def safe_path_component(value: str, fallback: str = "untitled") -> str:
+    """Sanitize a filename/path component while keeping it readable."""
+    text = (value or "").strip()
+    if not text:
+        return fallback
+
+    text = text.replace(" ", "_")
+    text = re.sub(r'[\\/:*?"<>|]+', "_", text)
+    text = re.sub(r"_+", "_", text)
+    text = text.strip("._")
+    return text or fallback
+
+
 def create_conversation_structure(base_path: Path, date_info: Dict[str, str], 
                                 conversation_name: str) -> Path:
     """Create the folder structure for a conversation"""
@@ -125,15 +138,7 @@ def enhance_markdown_content(content: str, conv_title: str, msg_idx: int,
     lines.append("")
     lines.append("---")
     lines.append("")
-    
-    # Add hashtags
-    hashtags = [f"#{conv_tag}"]
-    hashtags.extend(f"#{keyword.replace(' ', '-')}" for keyword in keywords)
-    lines.append(' '.join(hashtags))
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    
+
     # Add metadata table
     lines.append("| Field | Value |")
     lines.append("|-------|-------|")
@@ -176,7 +181,8 @@ def save_message_files(message: Dict[str, Any], idx: int, messages_folder: Path,
     
     # Extract and save markdown if detected
     if has_markdown and message.get('text'):
-        md_filename = f"{conv_title.replace(' ', '_')}-{idx:03d}_{message['sender'].title()}_Message.md"
+        safe_title = safe_path_component(conv_title)
+        md_filename = f"{safe_title}-{idx:03d}_{message['sender'].title()}_Message.md"
         md_path = messages_folder / md_filename  # Save to messages/ directory
         
         # Add metadata to markdown

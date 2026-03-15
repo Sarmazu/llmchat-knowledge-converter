@@ -14,8 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 import json
-
-from database import ConversationDatabase
+import re
 
 
 def validate_zip_file(zip_path: Path, provider: str) -> bool:
@@ -37,12 +36,24 @@ def validate_zip_file(zip_path: Path, provider: str) -> bool:
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             files = zf.namelist()
-            for required in required_files[provider]:
-                if not any(required in f for f in files):
+            if provider == 'chatgpt':
+                has_chatgpt_conversations = any(
+                    Path(name).name == 'conversations.json'
+                    or re.match(r'^conversations-\d+\.json$', Path(name).name)
+                    for name in files
+                )
+                if not has_chatgpt_conversations:
                     raise ValueError(
-                        f"Invalid {provider} export: missing {required}\n"
-                        f"Expected structure: {required_files[provider]}"
+                        "Invalid chatgpt export: missing conversations.json or conversations-*.json\n"
+                        "Expected structure: ['conversations.json']"
                     )
+            else:
+                for required in required_files[provider]:
+                    if not any(required in f for f in files):
+                        raise ValueError(
+                            f"Invalid {provider} export: missing {required}\n"
+                            f"Expected structure: {required_files[provider]}"
+                        )
         return True
     except zipfile.BadZipFile:
         raise ValueError(f"Invalid zip file: {zip_path}")
@@ -198,6 +209,30 @@ Search your converted chats:
         help='Skip interactive tag configuration'
     )
 
+    parser.add_argument(
+        '--existing-root',
+        help='Root folder containing prior imported batches for delta comparison'
+    )
+
+    parser.add_argument(
+        '--import-mode',
+        choices=['full', 'delta'],
+        default='delta',
+        help='Import mode for ChatGPT exports (default: delta)'
+    )
+
+    parser.add_argument(
+        '--delta-policy',
+        choices=['new-only', 'new-and-changed'],
+        default='new-and-changed',
+        help='When using delta mode, write only new conversations or both new and changed ones'
+    )
+
+    parser.add_argument(
+        '--plan-json',
+        help='Optional path to also write the delta classification plan JSON'
+    )
+
     args = parser.parse_args()
 
     # Validate input
@@ -253,7 +288,11 @@ Search your converted chats:
                 extracted_path,
                 output_path,
                 skip_tags=args.skip_tags,
-                generate_embeddings=not args.no_embeddings
+                generate_embeddings=not args.no_embeddings,
+                existing_root=Path(args.existing_root) if args.existing_root else None,
+                import_mode=args.import_mode,
+                delta_policy=args.delta_policy,
+                plan_json_path=Path(args.plan_json) if args.plan_json else None,
             )
 
     if success:

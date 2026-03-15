@@ -33,7 +33,7 @@ graph LR
 ### Installation
 
 ```bash
-git clone https://github.com/aaronsb/llmchat-knowledge-converter.git
+git clone https://github.com/Sarmazu/llmchat-knowledge-converter.git
 cd llmchat-knowledge-converter
 ./scripts/install-pipx.sh  # One-time setup
 ```
@@ -86,12 +86,23 @@ llmchat-search output/my-vault "topic" --json --ontology topic-name
 # Basic conversion (FTS search only)
 python src/convert.py claude ~/Downloads/export.zip --name my-vault --no-embeddings
 
+# ChatGPT delta import against prior batches
+python src/convert.py chatgpt ~/Downloads/export.zip --name my-vault \
+  --existing-root /path/to/01_Imports/llmchat --import-mode delta
+
 # With semantic search (requires Nomic API key)
-python src/convert.py chatgpt ~/Downloads/export.zip --name my-vault
+python src/convert.py chatgpt ~/Downloads/export.zip --name my-vault --import-mode full
 
 # Skip tag configuration
 python src/convert.py claude export.zip --name my-vault --skip-tags
 ```
+
+Delta mode classifies conversations by `uuid` and `updated_at`:
+- `new` conversations are written to the new batch
+- `changed` conversations can also be written with `--delta-policy new-and-changed`
+- `unchanged` conversations are skipped
+
+Each delta run writes `import_plan.json` into the output directory. Use `--plan-json` to also copy that plan elsewhere.
 
 **Output structure:**
 ```
@@ -103,9 +114,10 @@ output/my-vault/
 │               └── Barbecue_Philosophy_a1b2c3d4/
 │                   ├── messages/
 │                   │   ├── *.json          # Message metadata
-│                   │   └── *.md            # Markdown content (for KG)
+│                   │   └── *.md            # Readable markdown records without generated hashtag footers
 │                   ├── images/             # Preserved images
-│                   └── metadata.json
+│                   └── metadata.json       # Conversation-level metadata and extracted keywords
+├── import_plan.json             # Delta classification summary for ChatGPT imports
 ├── conversations.db            # SQLite with FTS5
 └── .obsidian/                 # Optional Obsidian config
 ```
@@ -222,10 +234,10 @@ export NOMIC_API_KEY=your_key_here
 llmchat-convert claude export.zip --name vault-with-embeddings
 ```
 
-### Tag Configuration
+### Obsidian Graph Configuration
 
 ```bash
-# Interactive tag/color setup (Obsidian graph)
+# Interactive graph/color setup (Obsidian graph)
 llmchat-convert claude export.zip --name my-vault
 
 # Skip interactive setup
@@ -235,13 +247,14 @@ llmchat-convert claude export.zip --name my-vault --skip-tags
 ### Custom Exclusions
 
 Edit `src/tag_exclusions.txt` to filter common words from keyword extraction.
+Extracted keywords are stored in each conversation `metadata.json`, not duplicated as inline hashtags in every markdown file.
 
 ## 📊 What Gets Indexed
 
 The SQLite database tracks:
 - **Conversations**: UUID, name, dates, message count, source provider
 - **Messages**: Sender, content, timestamps, code detection
-- **Keywords**: TF-IDF extracted tags with scores
+- **Keywords**: TF-IDF extracted conversation-level keywords
 - **Embeddings**: Optional semantic vectors (Nomic)
 - **Full-Text Search**: FTS5 virtual table for instant search
 
@@ -258,14 +271,14 @@ conversations/YYYY/MM-MonthName/DD/ConversationName_ID/
 │   ├── *-001_Assistant_Message.md   # Markdown (KG-ready)
 │   └── *-003_Assistant_Message.md
 ├── images/                      # Preserved media
-└── metadata.json                # Conversation metadata
+└── metadata.json                # Conversation metadata and extracted keywords
 ```
 
 ### Database Schema
 
 - `conversations` - Main conversation table
 - `messages` - Individual messages
-- `keywords` - Extracted tags
+- `keywords` - Extracted conversation-level keywords
 - `embeddings` - Semantic vectors
 - `messages_fts` - FTS5 virtual table
 

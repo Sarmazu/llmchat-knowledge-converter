@@ -39,6 +39,10 @@ class KeywordExtractor:
     """Extract keywords using TF-IDF and Bayesian-like scoring"""
     def __init__(self):
         self.stop_words = set(stopwords.words('english'))
+        try:
+            self.stop_words.update(stopwords.words('russian'))
+        except OSError:
+            pass
         # Add common programming and conversation stop words
         self.stop_words.update({
             'would', 'could', 'should', 'might', 'must', 'shall', 'will',
@@ -46,10 +50,46 @@ class KeywordExtractor:
             'want', 'need', 'help', 'please', 'thanks', 'thank', 'hello', 'hi',
             'yes', 'no', 'okay', 'ok', 'sure', 'right', 'left', 'top', 'bottom',
             'first', 'second', 'third', 'last', 'next', 'previous', 'current',
-            'new', 'old', 'good', 'bad', 'best', 'worst', 'better', 'worse'
+            'new', 'old', 'good', 'bad', 'best', 'worst', 'better', 'worse',
+            'none', 'pointer', 'audio', 'decimal', 'timestamp', 'transcription',
+            'source', 'folder', 'batch', 'template', 'project', 'pack', 'fact',
+            'tagged', 'team', 'gen', 'start', 'end', 'frame', 'screenshare'
         })
         self.doc_freq = defaultdict(int)
         self.total_docs = 0
+
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        token = token.strip().strip("'\"`.,:;!?()[]{}<>")
+        token = token.replace("\u2019", "").replace("\u2018", "")
+        return token
+
+    def _is_noise_token(self, token: str) -> bool:
+        if not token:
+            return True
+        if token in self.stop_words:
+            return True
+        if len(token) <= 2:
+            return True
+        if token in string.punctuation:
+            return True
+        if token.isdigit():
+            return True
+        if token.startswith('conv-'):
+            return True
+        if token.startswith(('/', '\\')) or '\\' in token:
+            return True
+        if re.search(r'https?://|file://', token):
+            return True
+        if re.search(r'[/=]', token):
+            return True
+        if re.search(r'^\d+(?:\.\d+){1,}$', token):
+            return True
+        if re.search(r'^\d{4}-\d{2}(?:-\d{2})?(?:t.+)?$', token):
+            return True
+        if re.search(r'^[#*!?`$%^&|~]+$', token):
+            return True
+        return False
         
     def preprocess_text(self, text: str) -> List[str]:
         """Tokenize and clean text"""
@@ -58,20 +98,19 @@ class KeywordExtractor:
         text = re.sub(r'`[^`]+`', '', text)  # Remove inline code
         text = re.sub(r'[#*_\[\]()]', ' ', text)  # Remove markdown symbols
         text = re.sub(r'https?://\S+', '', text)  # Remove URLs
+        text = re.sub(r'(?:[A-Za-z]:)?[\\/][^\s]+', ' ', text)  # Remove path-like strings
         
         # Tokenize
         tokens = word_tokenize(text.lower())
-        
-        # Filter tokens
-        tokens = [
-            token for token in tokens
-            if token not in self.stop_words
-            and token not in string.punctuation
-            and len(token) > 2
-            and not token.isdigit()
-        ]
-        
-        return tokens
+
+        cleaned_tokens = []
+        for raw_token in tokens:
+            token = self._normalize_token(raw_token)
+            if self._is_noise_token(token):
+                continue
+            cleaned_tokens.append(token)
+
+        return cleaned_tokens
     
     def extract_keywords(self, text: str, max_keywords: int = 7) -> List[str]:
         """Extract top keywords from text"""
@@ -212,7 +251,7 @@ def save_markdown_content(content: str, base_path: Path, filename: str = None,
         filepath = original_filepath.with_stem(f"{original_filepath.stem}_{counter}")
         counter += 1
     
-    # Prepare content with title and hashtags
+    # Prepare content with title and preserved metadata
     enhanced_content = ""
     
     # Add title if provided
@@ -222,25 +261,6 @@ def save_markdown_content(content: str, base_path: Path, filename: str = None,
             enhanced_content = f"# {conversation_title}\n\n"
     
     enhanced_content += content
-    
-    # Add hashtags at the end
-    hashtags = []
-    
-    # Add conversation tag first for grouping
-    if conversation_tag:
-        hashtags.append(f'#{conversation_tag}')
-        if tag_analyzer:
-            tag_analyzer.add_tag(conversation_tag, 'conversation')
-    
-    # Add keyword hashtags
-    if keywords:
-        for tag in keywords:
-            hashtags.append(f'#{tag}')
-            if tag_analyzer:
-                tag_analyzer.add_tag(tag, 'keyword')
-    
-    if hashtags:
-        enhanced_content += f"\n\n---\n\n{' '.join(hashtags)}"
     
     # Add metadata table
     metadata_table = ["\n\n---\n"]
@@ -304,7 +324,7 @@ def create_conversation_structure(conversation: Dict[str, Any], base_path: Path)
         month = date_obj.strftime('%m-%B')
         day = date_obj.strftime('%d')
         
-        # Store date info for hashtags
+        # Store date info for markdown metadata
         date_info = {
             'year': date_obj.strftime('%Y'),
             'month': date_obj.strftime('%B').lower(),
@@ -459,7 +479,7 @@ def save_project(project: Dict[str, Any], projects_folder: Path, keyword_extract
     project_folder = projects_folder / f"{project_name}_{project['uuid'][:8]}"
     project_folder.mkdir(parents=True, exist_ok=True)
     
-    # Parse date for hashtags
+    # Parse date for markdown metadata
     date_info = {}
     created_at = project.get('created_at', '')
     try:
@@ -923,7 +943,7 @@ def convert_claude_history(input_path: Path, output_path: Path,
             },
             'features': [
                 'Enhanced markdown titles with full conversation context',
-                'Automatic keyword extraction and hashtag generation',
+                'Automatic keyword extraction stored in conversation metadata',
                 'Human-readable titles throughout',
                 'Markdown files saved as .md with proper headers',
                 'Code blocks extracted to separate files',
@@ -1044,7 +1064,7 @@ def main():
         },
         'features': [
             'Enhanced markdown titles with full conversation context',
-            'Automatic keyword extraction and hashtag generation',
+            'Conversation keywords stored in metadata.json',
             'Human-readable titles throughout',
             'Markdown files saved as .md with proper headers',
             'Code blocks extracted to separate files',
@@ -1067,7 +1087,7 @@ def main():
     print(f"  - conversion_summary.json (this conversion info)")
     print(f"\nEnhanced Features:")
     print(f"  - Full conversation context in markdown titles")
-    print(f"  - Automatic keyword extraction with hashtags")
+    print(f"  - Automatic keyword extraction stored in metadata.json")
     print(f"  - Human-readable titles throughout")
     print(f"  - Code blocks saved as separate files")
     print(f"  - Keywords indexed for search and discovery")
